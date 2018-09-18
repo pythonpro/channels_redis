@@ -23,10 +23,54 @@ class ConnectionPool:
     taking into account asyncio event loops.
     """
 
+    class _AioGen:
+        """
+        Internal helper class for asyncio event loop shutdown.
+
+        The asgiref package calls `shutdown_asyncgens` on any event
+        loops it had to create anew, which we can use to get notified
+        about loop shutdown.
+        """
+
+        def __init__(self, loop, pool):
+            self.loop = loop
+            self.pool = pool
+            self.future = asyncio.Future(loop=loop)
+
+        async def it(self):
+            """
+            The iterator that will get registered for cleanup.
+            """
+            try:
+                await self.future
+                # The future above will never complete, but we need the
+                # yield to make python generate a generator.
+                yield None
+            finally:
+                # We're only expecting GeneratorExit to happen in this
+                # try block, but any interruption would make this
+                # generator useless, so clean up in any case.
+                self.future.set_result(None)
+                await self.future
+                await self.pool._close_loop(self.loop)
+                del self.pool.loop_gens[self.loop]
+
+        @staticmethod
+        async def run(loop, pool):
+            """
+            Utility method for actually running the generator.
+            """
+            gen = ConnectionPool._AioGen(loop, pool).it()
+            pool.loop_gens[loop] = gen
+            # Run the generator now so that it registers with asyncio.
+            async for _ in gen:
+                _ = _  # Empty loop, but make pyflakes happy.
+
     def __init__(self, host):
         self.host = host
         self.conn_map = {}
         self.in_use = {}
+        self.loop_gens = {}
 
     def _ensure_loop(self, loop):
         """
@@ -36,6 +80,7 @@ class ConnectionPool:
             loop = asyncio.get_event_loop()
 
         if loop not in self.conn_map:
+            asyncio.ensure_future(self._AioGen.run(loop, self), loop=loop)
             self.conn_map[loop] = []
 
         return self.conn_map[loop], loop
@@ -57,8 +102,9 @@ class ConnectionPool:
         """
         loop = self.in_use[conn]
         del self.in_use[conn]
-        conns, _ = self._ensure_loop(loop)
-        conns.append(conn)
+        if loop is not None:
+            conns, _ = self._ensure_loop(loop)
+            conns.append(conn)
 
     def conn_error(self, conn):
         """
@@ -74,6 +120,29 @@ class ConnectionPool:
         self.conn_map = {}
         self.in_use = {}
 
+    async def _close_loop(self, loop):
+        """
+        Close all connections owned by the pool on the given loop.
+        """
+        if loop in self.conn_map:
+            for conn in self.conn_map[loop]:
+                conn.close()
+                await conn.wait_closed()
+            del self.conn_map[loop]
+
+        for k, v in self.in_use.items():
+            if v is loop:
+                self.in_use[k] = None
+
+    async def close_loop(self, loop):
+        """
+        Close all connections on the given loop and shut it down.
+        """
+        if loop in self.loop_gens:
+            await self.loop_gens[loop].aclose()
+        else:
+            await self._close_loop(loop)
+
     async def close(self):
         """
         Close all connections owned by the pool.
@@ -88,6 +157,8 @@ class ConnectionPool:
         for conn in in_use:
             conn.close()
             await conn.wait_closed()
+        for gen in list(self.loop_gens.values()):
+            await gen.aclose()
 
 
 class ChannelLock:
